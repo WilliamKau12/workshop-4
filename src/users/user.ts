@@ -37,16 +37,10 @@ export async function user(userId: number) {
   // Route to receive messages
   _user.post("/message", (req, res) => {
     const { message }: MessageBody = req.body;
-
-    // Validate the request body
     if (!message) {
       return res.status(400).send("Message is required");
     }
-
-    // Update the last received message
     lastReceivedMessage = message;
-
-    // Return a plain text success response
     return res.send("success");
   });
 
