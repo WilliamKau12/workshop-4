@@ -1,85 +1,94 @@
 import bodyParser from "body-parser";
 import express from "express";
-import { BASE_ONION_ROUTER_PORT } from "../config";
-import crypto from "crypto";
+import { BASE_ONION_ROUTER_PORT, REGISTRY_PORT } from "../config";
+import { generateRsaKeyPair, exportPubKey, exportPrvKey, rsaDecrypt, symDecrypt } from "../crypto";
 
-// Global state to store node information
-let lastReceivedEncryptedMessage: string | null = null;
-let lastReceivedDecryptedMessage: string | null = null;
-let lastMessageDestination: number | null = null;
-let registeredNodes: { nodeId: number; pubKey: string }[] = [];
+export async function simpleOnionRouter(routerId: number) {
+  const app = express();
+  app.use(express.json());
+  app.use(bodyParser.json());
 
-export async function simpleOnionRouter(nodeId: number) {
-  // Generate a pair of private and public keys for the node
-  const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
-    modulusLength: 2048,
+  let lastEncryptedMessage: string | null = null;
+  let lastDecryptedMessage: string | null = null;
+  let lastDestination: number | null = null;
+
+  // Generate RSA key pair
+  const { publicKey, privateKey } = await generateRsaKeyPair();
+  const publicKeyBase64 = await exportPubKey(publicKey);
+  const privateKeyBase64 = await exportPrvKey(privateKey);
+
+  // Register the node with the registry
+  await fetch(`http://localhost:${REGISTRY_PORT}/registerNode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nodeId: routerId, pubKey: publicKeyBase64 }),
   });
 
-  // Convert keys to base64 strings for storage and transmission
-  const privateKeyBase64 = privateKey.export({ type: "pkcs1", format: "pem" }).toString("base64");
-  const publicKeyBase64 = publicKey.export({ type: "spki", format: "pem" }).toString("base64");
-
-  // Create an Express app
-  const onionRouter = express();
-  onionRouter.use(express.json());
-  onionRouter.use(bodyParser.json());
-
-  // Register the node on startup
-  registeredNodes.push({ nodeId, pubKey: publicKeyBase64 });
-
-  // Route to check the status of the node
-  onionRouter.get("/status", (req, res) => {
-    res.send("live");
+  // Status endpoint
+  app.get("/status", (req, res) => {
+    res.status(200).send("live");
   });
 
-  // Route to get the last received encrypted message
-  onionRouter.get("/getLastReceivedEncryptedMessage", (req, res) => {
-    res.json({ result: lastReceivedEncryptedMessage });
+  // Get last received encrypted message
+  app.get("/getLastReceivedEncryptedMessage", (req, res) => {
+    res.json({ result: lastEncryptedMessage });
   });
 
-  // Route to get the last received decrypted message
-  onionRouter.get("/getLastReceivedDecryptedMessage", (req, res) => {
-    res.json({ result: lastReceivedDecryptedMessage });
+  // Get last received decrypted message
+  app.get("/getLastReceivedDecryptedMessage", (req, res) => {
+    res.json({ result: lastDecryptedMessage });
   });
 
-  // Route to get the last message destination
-  onionRouter.get("/getLastMessageDestination", (req, res) => {
-    res.json({ result: lastMessageDestination });
+  // Get last message destination
+  app.get("/getLastMessageDestination", (req, res) => {
+    res.json({ result: lastDestination });
   });
 
-  // Route to register a new node
-  onionRouter.post("/registerNode", (req, res) => {
-    const { nodeId, pubKey } = req.body;
-
-    // Validate the request
-    if (typeof nodeId !== "number" || typeof pubKey !== "string") {
-      return res.status(400).json({ error: "Invalid nodeId or pubKey" });
-    }
-
-    // Check if the node is already registered
-    if (registeredNodes.some((node) => node.nodeId === nodeId)) {
-      return res.status(400).json({ error: "Node already registered" });
-    }
-
-    // Register the node
-    registeredNodes.push({ nodeId, pubKey });
-    return res.json({ result: "Node registered successfully" });
-  });
-
-  // Route to get the private key of the node (for testing purposes)
-  onionRouter.get("/getPrivateKey", (req, res) => {
+  // Get private key
+  app.get("/getPrivateKey", (req, res) => {
     res.json({ result: privateKeyBase64 });
   });
 
-  // Route to get the list of all registered nodes
-  onionRouter.get("/getNodeRegistry", (req, res) => {
-    res.json({ nodes: registeredNodes });
+  // Handle incoming messages
+  app.post("/message", async (req, res) => {
+    const { message } = req.body;
+
+    // Split the message into encrypted symmetric key and encrypted layer
+    const encryptedSymmetricKey = message.slice(0, 344);
+    const encryptedMessageLayer = message.slice(344);
+
+    // Decrypt the symmetric key using RSA
+    const symmetricKey = await rsaDecrypt(encryptedSymmetricKey, privateKey);
+
+    // Decrypt the message layer using the symmetric key
+    const decryptedLayer = await symDecrypt(symmetricKey, encryptedMessageLayer);
+
+    // Extract destination and inner message
+    const destination = parseInt(decryptedLayer.slice(0, 10), 10);
+    const innerMessage = decryptedLayer.slice(10);
+
+    // Update state
+    lastEncryptedMessage = message;
+    lastDecryptedMessage = innerMessage;
+    lastDestination = destination;
+
+    // Forward the message to the next destination
+    if (destination) {
+      await fetch(`http://localhost:${destination}/message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: innerMessage }),
+      });
+      res.status(200).send("success");
+    } else {
+      res.status(400).send("failed");
+    }
   });
 
   // Start the server
-  const port = BASE_ONION_ROUTER_PORT + nodeId;
-  const server = onionRouter.listen(port, () => {
-    console.log(`Onion router ${nodeId} is listening on port ${port}`);
+  const port = BASE_ONION_ROUTER_PORT + routerId;
+  const server = app.listen(port, () => {
+    console.log(`Onion router ${routerId} is listening on port ${port}`);
   });
 
   return server;
